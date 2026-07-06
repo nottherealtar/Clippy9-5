@@ -100,3 +100,33 @@ def test_publish_bounds_platform_specific_data():
             {"platform": "youtube", "accountId": "a",
              "platformSpecificData": {"evil": {"deep": 1}}},
         ])
+
+
+def test_auto_post_campaign_accepts_nested_compose_snapshot():
+    """compose_snapshot mirrors ComposeRequest — toggles is a dict, not a scalar."""
+    from clippyme.api.schemas import AutoPostCampaignCreate
+
+    req = AutoPostCampaignCreate.model_validate({
+        "name": "Auto Post Peanut Clips",
+        "items": [{"job_id": "d52a1180-a1b2-4c80-8000-000000000001", "clip_index": 0}],
+        "platforms": ["tiktok", "instagram", "youtube"],
+        "compose_snapshot": {
+            "toggles": {
+                "smartcut": False,
+                "hook": False,
+                "subtitles": False,
+                "logo": False,
+                "grade": False,
+            },
+            "hook_params": {"text": "", "position": "top", "size": "S", "offset_y": 0},
+            "subtitle_params": {"preset": "classic_white", "mode": "karaoke", "position": "bottom"},
+            "logo_params": {"position": "top-right", "size": "M"},
+            "grade_params": {"preset": "none"},
+        },
+        "publish_defaults": {
+            "auto_caption": True,
+            "use_cover_thumbnail": True,
+            "instagram_share_to_feed": True,
+        },
+    })
+    assert req.compose_snapshot.toggles["subtitles"] is False

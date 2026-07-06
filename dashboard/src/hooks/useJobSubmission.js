@@ -3,6 +3,7 @@ import { submitProcessJob, submitBatchJob } from '../lib/api';
 import { getApiUrl } from '../config';
 import { apiFetch } from '../lib/apiToken';
 import { tasteInstructionSuffix } from '../lib/taste';
+import { batchJobRow } from '../lib/downloadProgress';
 
 // Append the cross-job taste hint (#8) to a job's AI instructions so Gemini
 // biases viral detection toward what the user actually kept in past jobs.
@@ -26,6 +27,7 @@ export function useJobSubmission({
   setProcessingMedia,
   setPreselections,
   setJobId,
+  setBatchJobs,
   // Optional: called when a batch run hits every job's terminal
   // state. Lets the parent auto-navigate (e.g. to History) without
   // coupling this hook to a tab state machine.
@@ -50,6 +52,7 @@ export function useJobSubmission({
     setStatus('processing');
     setLogs(['Initializing engine...']);
     setResults(null);
+    setBatchJobs?.([]);
     setProcessingMedia(data);
     if (data.preselections) setPreselections(data.preselections);
 
@@ -70,6 +73,7 @@ export function useJobSubmission({
     setStatus('processing');
     setLogs(['Launching batch processing...']);
     setResults(null);
+    setBatchJobs?.([]);
     if (data.preselections) setPreselections(data.preselections);
 
     const urls = data.urls || [];
@@ -136,6 +140,7 @@ export function useJobSubmission({
       const total = allJobIds.length;
       const finished = new Set();
       const lastLogs = new Map(); // jid -> last `logs` array from status
+      const lastStatus = new Map(); // jid -> full status payload
       let succeeded = 0;
       let failed = 0;
 
@@ -154,6 +159,7 @@ export function useJobSubmission({
             const r = await apiFetch(getApiUrl(`/api/status/${jid}`));
             if (!r.ok) continue;
             const s = await r.json();
+            lastStatus.set(jid, s);
             if (Array.isArray(s.logs)) lastLogs.set(jid, s.logs);
             if (!finished.has(jid)) {
               // 'stopped' is terminal-with-clips (graceful stop keeps finished
@@ -191,6 +197,15 @@ export function useJobSubmission({
           merged.push('');
         }
         setLogs(merged);
+
+        if (setBatchJobs) {
+          setBatchJobs(allJobIds.map((jid, i) => batchJobRow(
+            jid,
+            i,
+            lastStatus.get(jid) || { logs: lastLogs.get(jid) || [] },
+            finished.has(jid),
+          )));
+        }
 
         if (finished.size >= total) {
           clearInterval(pollAll);

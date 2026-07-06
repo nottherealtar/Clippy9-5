@@ -354,6 +354,119 @@ from clippyme.pipeline.diarization import (  # noqa: E402
 )
 
 
+def _has_asr_api_key(env_name: str) -> bool:
+    return bool((os.getenv(env_name) or "").strip())
+
+
+def _transcribe_whisper_path(asr_input: str, video_path: str) -> dict:
+    """Local Faster-Whisper transcription (+ optional diarization)."""
+    device = "cuda" if CUDA_AVAILABLE else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    print(f"🎙️  Transcribing with Faster-Whisper [{WHISPER_MODEL}] ({device.upper()} mode)...")
+    model = _get_whisper_model(WHISPER_MODEL, device, compute_type)
+    # Honor per-job language override (set by main.py --language → CLIPPYME_LANGUAGE).
+    # 'multi' / '' / unset → let Faster-Whisper auto-detect.
+    _lang_override = (os.getenv("CLIPPYME_LANGUAGE") or "").strip().lower()
+    _whisper_lang = _lang_override if _lang_override and _lang_override != "multi" else None
+    if _whisper_lang:
+        print(f"   🌐 Whisper language override: {_whisper_lang}")
+    segments, info = model.transcribe(
+        asr_input, word_timestamps=True, language=_whisper_lang
+    )
+    segments = list(segments)
+
+    print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
+
+    # Convert to openai-whisper compatible format
+    transcript_segments = []
+    full_text = ""
+
+    for segment in segments:
+        # Print progress to keep user informed (and prevent timeouts feeling)
+        print(f"   [{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
+
+        seg_dict = {
+            'text': segment.text,
+            'start': segment.start,
+            'end': segment.end,
+            'words': []
+        }
+
+        if segment.words:
+            for word in segment.words:
+                seg_dict['words'].append({
+                    'word': word.word,
+                    'start': word.start,
+                    'end': word.end,
+                    'probability': word.probability
+                })
+
+        transcript_segments.append(seg_dict)
+        full_text += segment.text + " "
+
+    # --- Optional speaker diarization (pyannote.audio) ------------------
+    wav_tmp: str | None = None
+    diarize_enabled = (
+        (os.getenv("WHISPER_DIARIZE") or "true").strip().lower() != "false"
+        and bool((os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip())
+    )
+    try:
+        if diarize_enabled:
+            wav_tmp = _extract_audio_to_wav(video_path)
+        if wav_tmp:
+            turns = _diarize_with_pyannote(wav_tmp)
+            if turns:
+                flat_words: list[dict] = []
+                for seg in transcript_segments:
+                    flat_words.extend(seg.get("words") or [])
+                _assign_speakers_to_words(flat_words, turns)
+
+                for seg in transcript_segments:
+                    counts: dict[int, int] = {}
+                    for w in seg.get("words") or []:
+                        sp = w.get("speaker")
+                        if sp is None:
+                            continue
+                        counts[sp] = counts.get(sp, 0) + 1
+                    if counts:
+                        seg["speaker"] = max(counts, key=counts.get)
+
+                speakers_seen = {sp for _, _, sp in turns}
+                print(f"   🗣️  Whisper transcript enriched with {len(speakers_seen)} speaker label(s).")
+    finally:
+        if wav_tmp and os.path.exists(wav_tmp):
+            try:
+                os.remove(wav_tmp)
+            except OSError:
+                pass
+
+    return {
+        'text': full_text.strip(),
+        'segments': transcript_segments,
+        'language': info.language
+    }
+
+
+def _cloud_transcription_fallback(failed_provider: str, asr_input: str):
+    """Try alternate cloud ASR providers before falling back to Whisper."""
+    fallbacks: list[tuple[str, str, callable]] = []
+    if failed_provider != "elevenlabs" and _has_asr_api_key("ELEVENLABS_API_KEY"):
+        from clippyme.pipeline.elevenlabs_transcribe import transcribe_with_elevenlabs
+        fallbacks.append(("ElevenLabs Scribe", "elevenlabs", transcribe_with_elevenlabs))
+    if failed_provider != "deepgram" and _has_asr_api_key("DEEPGRAM_API_KEY"):
+        from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram
+        fallbacks.append(("Deepgram", "deepgram", transcribe_with_deepgram))
+
+    for label, name, fn in fallbacks:
+        try:
+            print(f"🔁 Primary ASR failed — trying {label} as fallback …", flush=True)
+            return fn(asr_input)
+        except Exception as exc:  # noqa: BLE001 — try next provider
+            logging.getLogger("clippyme").warning("%s fallback failed (%s)", label, exc)
+            print(f"⚠️  {label} fallback failed ({exc})")
+    return None
+
+
 def transcribe_video(video_path):
     """Dispatch to the configured transcription provider.
 
@@ -362,14 +475,11 @@ def transcribe_video(video_path):
       - "elevenlabs" → ElevenLabs Scribe REST API (requires ELEVENLABS_API_KEY)
       - anything else / "whisper" → local Faster-Whisper
 
-    On any cloud-provider failure we automatically fall back to Faster-Whisper
-    so a misconfigured key never breaks the pipeline.
+    Fallback chain (when a cloud provider is selected):
+      deepgram → elevenlabs (if key) → whisper
+      elevenlabs → deepgram (if key) → whisper
 
-    Whisper path: after transcription, optionally runs pyannote speaker
-    diarization (if ``pyannote.audio`` is installed and a HF token is
-    available) and merges speaker labels into the word timestamps so the
-    downstream Gemini prompt + subtitle writer see the same ``speaker``
-    field as the Deepgram path.
+    Whisper-only mode skips cloud fallbacks.
     """
     provider = (os.getenv("TRANSCRIPTION_PROVIDER") or "deepgram").strip().lower()
 
@@ -401,115 +511,39 @@ def transcribe_video(video_path):
             logging.getLogger("clippyme").warning("Voice isolation errored (%s) — skipping", exc)
 
     try:
+        result = None
         if provider == "deepgram":
             try:
-                from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram, DeepgramError
-                return transcribe_with_deepgram(asr_input)
+                from clippyme.pipeline.deepgram_transcribe import transcribe_with_deepgram
+                result = transcribe_with_deepgram(asr_input)
             except Exception as exc:  # noqa: BLE001 — broad catch for safe fallback
                 logging.getLogger("clippyme").warning(
-                    "Deepgram transcription failed (%s) — falling back to Faster-Whisper", exc
+                    "Deepgram transcription failed (%s) — trying fallback providers", exc
                 )
-                print(f"⚠️  Deepgram transcription failed ({exc}); falling back to Faster-Whisper.")
+                print(f"⚠️  Deepgram transcription failed ({exc})")
         elif provider == "elevenlabs":
             try:
                 from clippyme.pipeline.elevenlabs_transcribe import transcribe_with_elevenlabs
-                return transcribe_with_elevenlabs(asr_input)
+                result = transcribe_with_elevenlabs(asr_input)
             except Exception as exc:  # noqa: BLE001 — broad catch for safe fallback
                 logging.getLogger("clippyme").warning(
-                    "ElevenLabs transcription failed (%s) — falling back to Faster-Whisper", exc
+                    "ElevenLabs transcription failed (%s) — trying fallback providers", exc
                 )
-                print(f"⚠️  ElevenLabs transcription failed ({exc}); falling back to Faster-Whisper.")
+                print(f"⚠️  ElevenLabs transcription failed ({exc})")
+        elif provider == "whisper":
+            result = None
+        else:
+            result = None
 
-        device = "cuda" if CUDA_AVAILABLE else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        print(f"🎙️  Transcribing with Faster-Whisper [{WHISPER_MODEL}] ({device.upper()} mode)...")
-        model = _get_whisper_model(WHISPER_MODEL, device, compute_type)
-        # Honor per-job language override (set by main.py --language → CLIPPYME_LANGUAGE).
-        # 'multi' / '' / unset → let Faster-Whisper auto-detect.
-        _lang_override = (os.getenv("CLIPPYME_LANGUAGE") or "").strip().lower()
-        _whisper_lang = _lang_override if _lang_override and _lang_override != "multi" else None
-        if _whisper_lang:
-            print(f"   🌐 Whisper language override: {_whisper_lang}")
-        segments, info = model.transcribe(
-            asr_input, word_timestamps=True, language=_whisper_lang
-        )
-        segments = list(segments)
+        if result is None and provider in ("deepgram", "elevenlabs"):
+            result = _cloud_transcription_fallback(provider, asr_input)
 
-        print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
+        if result is None:
+            if provider in ("deepgram", "elevenlabs"):
+                print("⚠️  Cloud transcription unavailable — falling back to Faster-Whisper.")
+            result = _transcribe_whisper_path(asr_input, video_path)
 
-        # Convert to openai-whisper compatible format
-        transcript_segments = []
-        full_text = ""
-
-        for segment in segments:
-            # Print progress to keep user informed (and prevent timeouts feeling)
-            print(f"   [{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
-
-            seg_dict = {
-                'text': segment.text,
-                'start': segment.start,
-                'end': segment.end,
-                'words': []
-            }
-
-            if segment.words:
-                for word in segment.words:
-                    seg_dict['words'].append({
-                        'word': word.word,
-                        'start': word.start,
-                        'end': word.end,
-                        'probability': word.probability
-                    })
-
-            transcript_segments.append(seg_dict)
-            full_text += segment.text + " "
-
-        # --- Optional speaker diarization (pyannote.audio) ------------------
-        # Runs only when pyannote is installed AND HF token is set AND
-        # WHISPER_DIARIZE != "false". Short-circuit BEFORE extracting audio
-        # so we don't pay the ffmpeg cost when diarization is disabled.
-        wav_tmp: str | None = None
-        diarize_enabled = (
-            (os.getenv("WHISPER_DIARIZE") or "true").strip().lower() != "false"
-            and bool((os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN") or "").strip())
-        )
-        try:
-            if diarize_enabled:
-                wav_tmp = _extract_audio_to_wav(video_path)
-            if wav_tmp:
-                turns = _diarize_with_pyannote(wav_tmp)
-                if turns:
-                    # Flatten words, merge speakers, then distribute back to
-                    # their parent segments via majority vote.
-                    flat_words: list[dict] = []
-                    for seg in transcript_segments:
-                        flat_words.extend(seg.get("words") or [])
-                    _assign_speakers_to_words(flat_words, turns)
-
-                    for seg in transcript_segments:
-                        counts: dict[int, int] = {}
-                        for w in seg.get("words") or []:
-                            sp = w.get("speaker")
-                            if sp is None:
-                                continue
-                            counts[sp] = counts.get(sp, 0) + 1
-                        if counts:
-                            seg["speaker"] = max(counts, key=counts.get)
-
-                    speakers_seen = {sp for _, _, sp in turns}
-                    print(f"   🗣️  Whisper transcript enriched with {len(speakers_seen)} speaker label(s).")
-        finally:
-            if wav_tmp and os.path.exists(wav_tmp):
-                try:
-                    os.remove(wav_tmp)
-                except OSError:
-                    pass
-
-        return {
-            'text': full_text.strip(),
-            'segments': transcript_segments,
-            'language': info.language
-        }
+        return result
     finally:
         for _tmp in (_audio_tmp, _iso_tmp):
             if _tmp and os.path.exists(_tmp):
@@ -777,6 +811,72 @@ def build_texttiling_fallback(transcript_result, video_title):
         return None
 
 
+def render_planned_clips(clips_data, input_video, output_dir, video_title, args):
+    """Cut + reframe each planned clip. Skips clips whose final mp4 already exists."""
+    for i, clip in enumerate(clips_data.get('shorts') or []):
+        start = clip['start']
+        end = clip['end']
+        clip_filename = f"{video_title}_clip_{i+1}.mp4"
+        clip_source_path = os.path.join(output_dir, f"source_{clip_filename}")
+        clip_final_path = os.path.join(output_dir, clip_filename)
+
+        if os.path.isfile(clip_final_path):
+            print(f"\n⏭️  Clip {i+1} already rendered — skipping")
+            continue
+
+        print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
+        print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
+
+        clip_duration = float(end) - float(start)
+        cut_command = [
+            'ffmpeg', '-y',
+            '-ss', f'{float(start):.3f}',
+            '-i', input_video,
+            '-t', f'{clip_duration:.3f}',
+            *x264_video_args(faststart=False),
+            '-vsync', 'cfr',
+            '-c:a', 'aac',
+            clip_source_path,
+        ]
+        print(f"   ✂️  ffmpeg cut: seek→{start:.2f}s, duration={clip_duration:.2f}s …", flush=True)
+        try:
+            cut_proc = subprocess.run(
+                cut_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=600,
+            )
+            if cut_proc.returncode != 0:
+                err_tail = (cut_proc.stderr or b'').decode('utf-8', errors='replace')[-500:]
+                print(f"   ⚠️  ffmpeg cut failed (code {cut_proc.returncode}): {err_tail}", flush=True)
+                continue
+            print(f"   ✅ ffmpeg cut done", flush=True)
+        except subprocess.TimeoutExpired:
+            print(
+                f"   ❌ ffmpeg cut TIMED OUT after 10 min — skipping this clip. "
+                f"Input may be corrupt or seek is stuck.",
+                flush=True,
+            )
+            continue
+
+        success = process_video_to_vertical(
+            clip_source_path, clip_final_path,
+            reframe_mode=args.reframe_mode,
+            zoom_end=None if args.no_zoom else 1.05)
+
+        if success:
+            normalize_audio(clip_final_path)
+            select_cover_frame(clip_final_path)
+            print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
+            print(f"      📼 Source slice preserved at: {clip_source_path}")
+        else:
+            print(
+                f"   ❌ Clip {i+1} reframe failed — skipping "
+                f"(source slice kept at {clip_source_path})",
+                flush=True,
+            )
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="AutoCrop-Vertical with Viral Clip Detection.")
     
@@ -808,6 +908,9 @@ if __name__ == '__main__':
                         help="Override the Gemini model for viral detection on THIS job (e.g. "
                              "'gemini-2.5-pro', 'gemini-3.1-pro-preview'). When unset, the pipeline uses "
                              "GEMINI_MODEL from env / Settings (default gemini-3.5-flash).")
+    parser.add_argument('--resume', action='store_true',
+                        help="Resume a partially completed job in -o (skips finished clips; "
+                             "reuses metadata when available).")
 
     args = parser.parse_args()
 
@@ -934,10 +1037,35 @@ if __name__ == '__main__':
         print(f"❌ Input file not found: {input_video}")
         sys.exit(1)
 
+    skip_to_render = False
+    resume_clips_data = None
+    if args.resume:
+        from clippyme.domain.job_recovery import inspect_job_dir, PHASE_COMPLETE, PHASE_RENDER
+        plan = inspect_job_dir(output_dir)
+        if plan.phase == PHASE_COMPLETE:
+            print(f"✅ Job already complete ({plan.rendered_clips}/{plan.total_clips} clips). Nothing to resume.")
+            sys.exit(0)
+        if plan.phase == PHASE_RENDER and plan.metadata_path:
+            print(f"♻️  Resuming render — {plan.rendered_clips}/{plan.total_clips} clips already on disk")
+            with open(plan.metadata_path, encoding="utf-8") as f:
+                resume_clips_data = json.load(f)
+            skip_to_render = True
+            if plan.source_video:
+                input_video = plan.source_video
+                video_title = os.path.splitext(os.path.basename(input_video))[0]
+        else:
+            print(f"♻️  Resuming job ({plan.summary()})")
+            if plan.source_video and not args.input and not args.url:
+                input_video = plan.source_video
+                video_title = os.path.splitext(os.path.basename(input_video))[0]
+
     # 2. Decision: Analyze clips or process whole?
-    if args.skip_analysis:
+    if skip_to_render and resume_clips_data:
+        print(f"🔥 Resuming {len(resume_clips_data.get('shorts') or [])} planned clips")
+        render_planned_clips(resume_clips_data, input_video, output_dir, video_title, args)
+    elif args.skip_analysis:
         print("⏩ Skipping analysis, processing entire video...")
-        output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
+        output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
         process_video_to_vertical(input_video, output_file, reframe_mode=args.reframe_mode)
     else:
         # 3. Transcribe (with cache for URL-based jobs)
@@ -1084,93 +1212,7 @@ if __name__ == '__main__':
             print(f"   Saved metadata to {metadata_file}")
 
             # 5. Process each clip
-            for i, clip in enumerate(clips_data['shorts']):
-                start = clip['start']
-                end = clip['end']
-                print(f"\n🎬 Processing Clip {i+1}: {start}s - {end}s")
-                print(f"   Title: {clip.get('video_title_for_youtube_short', 'No Title')}")
-                
-                # Cut clip
-                clip_filename = f"{video_title}_clip_{i+1}.mp4"
-                # Keep the 16:9 source slice persistently so the user can
-                # later switch reframe modes from the dashboard without
-                # re-running the entire pipeline. Naming convention:
-                # source_<clip_filename>  (picked up by /api/reframe).
-                clip_source_path = os.path.join(output_dir, f"source_{clip_filename}")
-                clip_final_path = os.path.join(output_dir, clip_filename)
-
-                # ffmpeg cut
-                # Using re-encoding for precision as requested by strict seconds.
-                # NOTE on seek: `-ss` BEFORE `-i` uses fast input seek (jumps
-                # to the nearest keyframe before `start` and then decodes
-                # forward to the exact start). On very long source videos
-                # (e.g. 1h+) this can take 30-60s for the first cut — the
-                # file has to be partially decoded to reach the target.
-                # Subsequent cuts on the same file are usually faster.
-                clip_duration = float(end) - float(start)
-                cut_command = [
-                    'ffmpeg', '-y',
-                    '-ss', f'{float(start):.3f}',
-                    '-i', input_video,
-                    '-t', f'{clip_duration:.3f}',
-                    # -pix_fmt yuv420p + -vsync cfr guarantee the persisted source
-                    # slice is universally decodable and constant-frame-rate, so the
-                    # downstream reframe render (which writes raw frames at a fixed
-                    # -r) can't drift against audio even if the original download was
-                    # VFR (ported from kamilstanuch/Autocrop-vertical).
-                    # Shared encode settings (CRF 18 / medium) — this slice feeds
-                    # every later generation, so it must not be the weak link.
-                    *x264_video_args(faststart=False),
-                    '-vsync', 'cfr',
-                    '-c:a', 'aac',
-                    clip_source_path,
-                ]
-                # Emit a "beat" before/after so the user sees progress even
-                # though ffmpeg runs silent (stdout=DEVNULL). Hard timeout of
-                # 10 minutes per cut prevents an infinite hang on corrupt
-                # sources — 10 min is ~10x the worst legitimate seek time
-                # on a 1 hour input video.
-                print(f"   ✂️  ffmpeg cut: seek→{start:.2f}s, duration={clip_duration:.2f}s …", flush=True)
-                try:
-                    cut_proc = subprocess.run(
-                        cut_command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        timeout=600,  # 10 min hard cap
-                    )
-                    if cut_proc.returncode != 0:
-                        err_tail = (cut_proc.stderr or b'').decode('utf-8', errors='replace')[-500:]
-                        print(f"   ⚠️  ffmpeg cut failed (code {cut_proc.returncode}): {err_tail}", flush=True)
-                        continue
-                    else:
-                        print(f"   ✅ ffmpeg cut done", flush=True)
-                except subprocess.TimeoutExpired:
-                    print(f"   ❌ ffmpeg cut TIMED OUT after 10 min — skipping this clip. Input may be corrupt or seek is stuck.", flush=True)
-                    continue
-
-                # Process vertical from the preserved source slice. Ken Burns
-                # zoom rides inside the master encode (zoom_end) — see
-                # process_video_to_vertical; the old apply_subtle_zoom pass
-                # only runs as its internal fallback.
-                success = process_video_to_vertical(
-                    clip_source_path, clip_final_path,
-                    reframe_mode=args.reframe_mode,
-                    zoom_end=None if args.no_zoom else 1.05)
-
-                if success:
-                    normalize_audio(clip_final_path)
-                    select_cover_frame(clip_final_path)
-                    print(f"   ✅ Clip {i+1} ready: {clip_final_path}")
-                    print(f"      📼 Source slice preserved at: {clip_source_path}")
-                else:
-                    # Without this line the clip is simply ABSENT from the
-                    # results grid with zero breadcrumb in the job log.
-                    print(f"   ❌ Clip {i+1} reframe failed — skipping "
-                          f"(source slice kept at {clip_source_path})", flush=True)
-
-                # NOTE: we intentionally do NOT delete clip_source_path.
-                # It's needed by POST /api/reframe/{job_id}/{clip_index} to
-                # re-run reframing with a different mode on demand.
+            render_planned_clips(clips_data, input_video, output_dir, video_title, args)
 
     # Clean up original if requested
     if args.url and not args.keep_original and os.path.exists(input_video):

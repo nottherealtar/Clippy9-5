@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 
 logger = logging.getLogger("clippyme")
 
@@ -56,6 +57,7 @@ def build_main_cmd(
     skip_analysis: bool = False,
     aspect: str | None = None,
     model: str | None = None,
+    resume: bool = False,
 ) -> list[str]:
     """Build a `python -u -m clippyme.pipeline.main ...` command line for a single processing job."""
     if reframe_mode is not None and reframe_mode not in ALLOWED_REFRAME_MODES:
@@ -81,7 +83,7 @@ def build_main_cmd(
     if input_path and input_path.lstrip().startswith("-"):
         raise ValueError("input_path must not start with '-'")
 
-    cmd = ["python", "-u", "-m", "clippyme.pipeline.main"]
+    cmd = [sys.executable, "-u", "-m", "clippyme.pipeline.main"]
     if url:
         cmd.extend(["-u", url])
         if cookies_path and os.path.exists(cookies_path):
@@ -103,6 +105,8 @@ def build_main_cmd(
         cmd.append("--skip-analysis")
     if model and model.strip():
         cmd.extend(["--model", model.strip()])
+    if resume:
+        cmd.append("--resume")
     return cmd
 
 
@@ -139,6 +143,10 @@ def _build_clips(data: dict, base_name: str, job_id: str, output_dir: str, only_
         if only_ready and not exists:
             continue
         clip['video_url'] = f"/videos/{job_id}/{clip_filename}"
+        cover_filename = f"{base_name}_clip_{i + 1}_cover.jpg"
+        cover_path = os.path.join(output_dir, cover_filename)
+        if os.path.isfile(cover_path) and os.path.getsize(cover_path) > 0:
+            clip['cover_url'] = f"/videos/{job_id}/{cover_filename}"
         # Attach the ABSOLUTE position in the original `shorts` array.
         # This is the React key the frontend uses for useClipStates[]
         # and for the ResultsGrid map. Without it, partial-result

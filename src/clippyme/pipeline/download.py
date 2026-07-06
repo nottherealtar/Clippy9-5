@@ -15,6 +15,42 @@ from urllib.parse import urlparse
 
 import yt_dlp
 
+from clippyme.pipeline.download_progress import (
+    format_download_finished_line,
+    format_download_progress_line,
+    should_emit_progress,
+)
+
+
+def _make_progress_hook(video_title: str):
+    """Return a yt-dlp progress hook that prints throttled speed lines."""
+    state = {"last_pct": None, "last_emit": 0.0, "started": time.time()}
+
+    def hook(d):
+        now = time.time()
+        if d.get("status") == "downloading":
+            from clippyme.pipeline.download_progress import download_pct
+
+            pct = download_pct(d)
+            if should_emit_progress(
+                pct=pct,
+                last_pct=state["last_pct"],
+                last_emit=state["last_emit"],
+                now=now,
+            ):
+                line = format_download_progress_line(d, title=video_title)
+                if line:
+                    print(line, flush=True)
+                    state["last_pct"] = pct
+                    state["last_emit"] = now
+        elif d.get("status") == "finished":
+            elapsed = now - state["started"]
+            line = format_download_finished_line(d, title=video_title, elapsed=elapsed)
+            if line:
+                print(line, flush=True)
+
+    return hook
+
 
 def _reject_rebound_internal(url: str) -> None:
     """Re-resolve the URL host at download time and refuse if it now points
@@ -203,6 +239,7 @@ Technical Details: {str(e)}
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
         'overwrites': True,
+        'progress_hooks': [_make_progress_hook(video_title)],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:

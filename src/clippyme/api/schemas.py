@@ -47,6 +47,21 @@ def validate_public_url(value: str) -> str:
     return raw
 
 
+def _validate_iana_timezone(v: str) -> str:
+    """Accept an IANA timezone name if ZoneInfo can load it.
+
+    ``available_timezones()`` is empty on Windows when the ``tzdata`` wheel
+    isn't installed, so we validate by instantiation instead of set membership.
+    """
+    from zoneinfo import ZoneInfo
+
+    try:
+        ZoneInfo(v)
+    except Exception as exc:
+        raise ValueError(f"unknown timezone: {v!r}") from exc
+    return v
+
+
 class ProcessRequest(BaseModel):
     url: str = Field(..., max_length=2048)
 
@@ -218,6 +233,14 @@ class EditAIRequest(BaseModel):
     )
 
 
+class CaptionAIRequest(BaseModel):
+    """Generate a social post caption (+ hashtags) for a clip."""
+    platform: str = Field("tiktok", pattern=r"^(tiktok|instagram|youtube|all)$")
+    model: Optional[str] = Field(
+        None, max_length=64, pattern=r"^gemini-[A-Za-z0-9.\-]{1,64}$"
+    )
+
+
 class PublishRequest(BaseModel):
     """Schedule a clip on social platforms via Zernio.
 
@@ -244,16 +267,7 @@ class PublishRequest(BaseModel):
     @field_validator("timezone")
     @classmethod
     def _validate_tz(cls, v: str) -> str:
-        # Reject unknown IANA zones at the boundary (defends SmartScheduler /
-        # Zernio from a crafted tz string). Falls back to allowing the value
-        # if the tz database isn't available on the host.
-        try:
-            from zoneinfo import available_timezones
-            if v not in available_timezones():
-                raise ValueError(f"unknown timezone: {v!r}")
-        except ImportError:
-            pass
-        return v
+        return _validate_iana_timezone(v)
 
     @field_validator("scheduled_for")
     @classmethod
@@ -275,8 +289,30 @@ class PublishRequest(BaseModel):
     logo_params: Optional[dict] = None
     grade_params: Optional[dict] = None
     drop_ranges: Optional[list] = None
+    # Zernio extras — applied to every selected platform that supports them.
+    first_comment: Optional[str] = Field(None, max_length=10000)
+    use_cover_thumbnail: bool = True
+    youtube_tags: Optional[List[str]] = Field(None, max_length=30)
+    instagram_share_to_feed: bool = True
+    # Optional per-platform caption overrides (tiktok/instagram/youtube keys).
+    per_platform_content: Optional[dict] = None
 
-    @field_validator("hook_params", "subtitle_params", "logo_params", "grade_params")
+    @field_validator("youtube_tags")
+    @classmethod
+    def _bound_youtube_tags(cls, v):
+        if v is None:
+            return v
+        if len(v) > 30:
+            raise ValueError("youtube_tags: max 30 entries")
+        for tag in v:
+            if not isinstance(tag, str) or len(tag) > 100:
+                raise ValueError("each youtube tag must be a string <= 100 chars")
+        return v
+
+    @field_validator("per_platform_content")
+    @classmethod
+    def _bound_per_platform_content(cls, v):
+        return None if v is None else _validate_overlay_params(v)
     @classmethod
     def _bound_overlay(cls, v):
         return _validate_overlay_params(v)
@@ -325,6 +361,19 @@ class ZernioConfigRequest(BaseModel):
     api_key: Optional[str] = Field(None, max_length=512)
     accounts: Optional[dict] = None  # {"tiktok": "...", "instagram": "...", "youtube": "..."}
     timezone: Optional[str] = Field(None, max_length=64)
+    publish_defaults: Optional[dict] = None
+
+    @field_validator("publish_defaults")
+    @classmethod
+    def _bound_publish_defaults(cls, v):
+        return None if v is None else _validate_overlay_params(v)
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_zernio_tz(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_iana_timezone(v)
 
     @field_validator("accounts")
     @classmethod
@@ -340,3 +389,61 @@ class ZernioConfigRequest(BaseModel):
             if val is not None and (not isinstance(val, str) or len(val) > 256):
                 raise ValueError(f"account id for {k!r} must be a string <= 256 chars")
         return v
+
+
+class AutoPostItemRef(BaseModel):
+    job_id: str = Field(..., min_length=36, max_length=36)
+    clip_index: int = Field(..., ge=0, le=99)
+    viral_score: Optional[int] = Field(None, ge=0, le=100)
+    title: Optional[str] = Field(None, max_length=200)
+    caption_snapshot: Optional[dict] = None
+    youtube_tags: Optional[List[str]] = Field(None, max_length=30)
+    compose_params: Optional[dict] = None
+
+    @field_validator("job_id")
+    @classmethod
+    def _validate_job_id(cls, v: str) -> str:
+        from clippyme.domain.history_service import is_valid_job_id
+        if not is_valid_job_id(v):
+            raise ValueError("invalid job_id")
+        return v
+
+    @field_validator("caption_snapshot", "compose_params")
+    @classmethod
+    def _bound_item_overlay(cls, v):
+        return None if v is None else _validate_overlay_params(v)
+
+
+class AutoPostCampaignCreate(BaseModel):
+    name: str = Field("", max_length=120)
+    items: List[AutoPostItemRef] = Field(..., min_length=1, max_length=100)
+    platforms: List[str] = Field(default_factory=lambda: ["tiktok"])
+    posts_per_day: int = Field(1, ge=1, le=5)
+    start_date: Optional[str] = Field(None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    timezone: str = Field("Europe/Rome", max_length=64)
+    # Same shape as ComposeRequest (toggles + layer params), not flat overlay keys.
+    compose_snapshot: Optional[ComposeRequest] = None
+    publish_defaults: Optional[dict] = None
+    tiktok_settings: Optional[dict] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_auto_post_tz(cls, v: str) -> str:
+        return _validate_iana_timezone(v)
+
+    @field_validator("platforms")
+    @classmethod
+    def _validate_auto_post_platforms(cls, v: List[str]) -> List[str]:
+        allowed = {"tiktok", "instagram", "youtube"}
+        if not v:
+            raise ValueError("at least one platform required")
+        for p in v:
+            if p not in allowed:
+                raise ValueError(f"platform must be one of {sorted(allowed)}")
+        return v
+
+    @field_validator("publish_defaults", "tiktok_settings")
+    @classmethod
+    def _bound_campaign_overlay(cls, v):
+        return None if v is None else _validate_overlay_params(v)
+

@@ -70,6 +70,11 @@ export function pipelineStepMeta(logs = [], opts = {}) {
   if (joined.includes('falling back to Faster-Whisper')) {
     m = joined.match(/Transcribing with Faster-Whisper \[([^\]]+)\]/);
     meta.transcribe = m ? `whisper ${m[1].trim().toLowerCase()} (fallback)` : 'whisper (fallback)';
+  } else if (/trying ElevenLabs Scribe as fallback/i.test(joined)) {
+    meta.transcribe = 'elevenlabs scribe (fallback)';
+  } else if (/trying Deepgram as fallback/i.test(joined)) {
+    m = joined.match(/Transcribing with Deepgram \[([^,\]]+)/);
+    meta.transcribe = m ? `deepgram ${m[1].trim().toLowerCase()} (fallback)` : 'deepgram (fallback)';
   } else if ((m = joined.match(/Transcribing with Deepgram \[([^,\]]+)/))) {
     meta.transcribe = `deepgram ${m[1].trim().toLowerCase()}`;
   } else if ((m = joined.match(/Transcribing with Faster-Whisper \[([^\]]+)\]/))) {

@@ -22,6 +22,13 @@ VALID_CONFIG_KEYS = (
 #   { "zernio": { "api_key": "sk_...", "accounts": {...}, "timezone": "..." } }
 ZERNIO_CONFIG_NAMESPACE = "zernio"
 
+DEFAULT_PUBLISH_DEFAULTS = {
+    "first_comment": "",
+    "use_cover_thumbnail": True,
+    "auto_caption": True,
+    "instagram_share_to_feed": True,
+}
+
 
 def _read_raw_config() -> dict:
     if not os.path.exists(CONFIG_FILE):
@@ -69,14 +76,22 @@ def load_zernio_config() -> dict:
     """Return persisted Zernio settings (or an empty dict)."""
     raw = _read_raw_config()
     z = raw.get(ZERNIO_CONFIG_NAMESPACE) or {}
+    publish_defaults = dict(DEFAULT_PUBLISH_DEFAULTS)
+    publish_defaults.update(z.get("publish_defaults") or {})
     return {
         "api_key": z.get("api_key", ""),
         "accounts": z.get("accounts", {}),
         "timezone": z.get("timezone", "Europe/Rome"),
+        "publish_defaults": publish_defaults,
     }
 
 
-def save_zernio_config(api_key: str = None, accounts: dict = None, timezone: str = None) -> bool:
+def save_zernio_config(
+    api_key: str = None,
+    accounts: dict = None,
+    timezone: str = None,
+    publish_defaults: dict = None,
+) -> bool:
     """Merge-update Zernio settings. Pass None to leave a field unchanged.
     Pass empty string for api_key to clear it.
     """
@@ -98,6 +113,12 @@ def save_zernio_config(api_key: str = None, accounts: dict = None, timezone: str
         current["accounts"] = merged
     if timezone is not None:
         current["timezone"] = timezone
+    if publish_defaults is not None:
+        merged_pd = dict(current.get("publish_defaults") or DEFAULT_PUBLISH_DEFAULTS)
+        for k, v in publish_defaults.items():
+            if k in DEFAULT_PUBLISH_DEFAULTS:
+                merged_pd[k] = v
+        current["publish_defaults"] = merged_pd
     raw[ZERNIO_CONFIG_NAMESPACE] = current
     return _write_raw_config(raw)
 
@@ -112,6 +133,7 @@ def zernio_config_status() -> dict:
         "api_key_masked": masked,
         "accounts": cfg.get("accounts", {}),
         "timezone": cfg.get("timezone", "Europe/Rome"),
+        "publish_defaults": cfg.get("publish_defaults", dict(DEFAULT_PUBLISH_DEFAULTS)),
     }
 
 

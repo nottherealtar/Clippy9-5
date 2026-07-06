@@ -12,8 +12,10 @@ import { ProcessingView } from './processing';
 import { ResultsView } from './results';
 import { PublishModal } from './publish';
 import { HistoryView, SettingsView, ApiKeyModal } from './views';
+import { AutoPostView } from './autoPost';
 import { EditClipModal } from './captions';
-import { optsToPreselections, restoreJob, listBackendJobIds, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip } from './realApi';
+import { optsToPreselections, restoreJob, retryHistoryJob, fetchBackendHistory, deleteHistoryJob, cancelJob, pauseJob, resumeJob, stopJob, reframeClip, composeClip } from './realApi';
+import { mergeHistoryEntries } from '../lib/historyMerge';
 import { allPresets, getDefaultPresetOpts, getDefaultPresetId, saveUserPreset, deleteUserPreset, setDefaultPreset } from './presets';
 import { HOOK_STYLE_DEFAULT } from './data';
 import { clipStateToParams, buildBulkPlan } from '../lib/bulkApply';
@@ -85,6 +87,7 @@ export default function RedesignApp() {
   const [status, setStatus] = useState('idle'); // idle | processing | complete | error
   const [results, setResults] = useState(null);
   const [logs, setLogs] = useState([]);
+  const [batchJobs, setBatchJobs] = useState([]);
   const [currentStep, setCurrentStep] = useState(null);
   const [processingMedia, setProcessingMedia] = useState(null);
   const [paused, setPaused] = useState(false);
@@ -113,8 +116,14 @@ export default function RedesignApp() {
   // don't disable anything). Reconciles the localStorage history list against
   // reality so jobs wiped by a rebuild are flagged instead of dead-clicking.
   const [availableJobIds, setAvailableJobIds] = useState(null);
+  const [diskHistory, setDiskHistory] = useState([]);
 
   const { history, saveToHistory, deleteFromHistory, clearHistory } = useHistory();
+
+  const displayHistory = useMemo(
+    () => mergeHistoryEntries(history, diskHistory),
+    [history, diskHistory],
+  );
   const { cookiesConfigured, setCookiesConfigured } = useBackendStatus();
   const { states: clipStates, updateClip: updateClipState } = useClipStates(jobId);
 
@@ -138,7 +147,14 @@ export default function RedesignApp() {
   // files were removed (rebuild/cleanup) shows as unavailable rather than
   // failing silently when clicked.
   useEffect(() => {
-    if (tab === 'history' && !viewingHistory) listBackendJobIds().then(setAvailableJobIds);
+    if (tab === 'history' && !viewingHistory) {
+      fetchBackendHistory()
+        .then((jobs) => {
+          setDiskHistory(jobs || []);
+          setAvailableJobIds(new Set((jobs || []).map((j) => j.jobId).filter(Boolean)));
+        })
+        .catch(() => setAvailableJobIds(null));
+    }
   }, [tab, viewingHistory]);
   useSessionPersistence({ status, jobId, results, processingMedia, activeTab: tab, preselections });
 
@@ -274,17 +290,25 @@ export default function RedesignApp() {
       });
     },
     onCancelled: () => { setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setCurrentStep(null); setPaused(false); },
-    onFailed: (errorMsg) => {
+    onFailed: (data) => {
       setStatus('error');
-      setLogs((prev) => [...prev, 'Error: ' + errorMsg]);
-      pushToast('error', 'Job failed: ' + String(errorMsg).slice(0, 80));
+      const backendLogs = Array.isArray(data?.logs) ? data.logs : [];
+      if (backendLogs.length) {
+        setLogs(backendLogs);
+      } else {
+        setLogs((prev) => [...prev, 'Error: ' + (data?.error || 'Process failed')]);
+      }
+      const tail = backendLogs.length
+        ? backendLogs[backendLogs.length - 1]
+        : (data?.error || 'Process failed');
+      pushToast('error', 'Job failed: ' + String(tail).slice(0, 120));
     },
     onProgress: (lg, step) => { setLogs(lg); if (step) setCurrentStep(step); },
   });
 
   const { handleProcess, handleBatchProcess } = useJobSubmission({
     apiKey, setShowKeyModal, setStatus, setLogs, setResults, setProcessingMedia,
-    setPreselections, setJobId,
+    setPreselections, setJobId, setBatchJobs,
     onBatchFinished: ({ succeeded, failed, total }) => {
       setTab('history');
       pushToast(failed === 0 ? 'success' : 'warn', `Batch: ${succeeded}/${total} ok${failed ? `, ${failed} failed` : ''}`);
@@ -319,7 +343,8 @@ export default function RedesignApp() {
     // If a job is still running, actually cancel it on the backend instead of
     // just dropping our local handle (which would leave it churning).
     if (status === 'processing' && jobId) cancelJob(jobId);
-    setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setProcessingMedia(null);
+    setStatus('idle'); setJobId(null); setResults(null); setLogs([]); setBatchJobs([]);
+    setProcessingMedia(null);
     setCurrentStep(null); setViewingHistory(false); setTab('create'); setPaused(false);
     try { localStorage.removeItem('clippyme_session'); } catch { /* */ }
   };
@@ -376,6 +401,25 @@ export default function RedesignApp() {
       } else {
         pushToast('error', 'Could not restore this job');
       }
+    }
+  };
+
+  const retryHistoryJobFlow = async (h) => {
+    if (!apiKey) { setShowKeyModal(true); return; }
+    try {
+      const data = await retryHistoryJob(h.jobId, apiKey);
+      setJobId(h.jobId);
+      setStatus('processing');
+      setResults(null);
+      setLogs([`Retry queued — ${data.summary || data.phase}`]);
+      setCurrentStep(null);
+      setPaused(false);
+      setProcessingMedia({ type: h.sourceType || 'url', payload: h.source || h.jobId });
+      setTab('create');
+      setViewingHistory(false);
+      pushToast('success', `Retrying: ${data.summary || 'pipeline'}`);
+    } catch (e) {
+      pushToast('error', e?.message || 'Retry failed');
     }
   };
 
@@ -443,7 +487,7 @@ export default function RedesignApp() {
       )}
       {tab === 'create' && (status === 'processing' || status === 'error') && (
         <ProcessingView media={processingMedia} status={status} logs={logs} step={currentStep}
-          clips={clips} opts={opts} onCancel={resetToCreate} onRetry={startJob}
+          batchJobs={batchJobs} clips={clips} opts={opts} onCancel={resetToCreate} onRetry={startJob}
           paused={paused} onPause={pauseCurrent} onResume={resumeCurrent} onStop={stopCurrent} />
       )}
       {tab === 'create' && status === 'complete' && (
@@ -454,10 +498,26 @@ export default function RedesignApp() {
           pushToast={pushToast} />
       )}
 
+      {tab === 'autopost' && (
+        <AutoPostView preselections={preselections} pushToast={pushToast} />
+      )}
+
       {tab === 'history' && !viewingHistory && (
-        <HistoryView history={history} availableIds={availableJobIds}
+        <HistoryView history={displayHistory} availableIds={availableJobIds}
           onOpen={openHistoryJob}
-          onDelete={(id) => { deleteFromHistory(id); pushToast('info', 'Job deleted'); }}
+          onRetry={retryHistoryJobFlow}
+          onDelete={async (id) => {
+            deleteFromHistory(id);
+            try { await deleteHistoryJob(id); } catch { /* already gone on disk */ }
+            setDiskHistory((prev) => prev.filter((h) => h.jobId !== id));
+            setAvailableJobIds((prev) => {
+              if (!prev) return prev;
+              const next = new Set(prev);
+              next.delete(id);
+              return next;
+            });
+            pushToast('info', 'Job deleted');
+          }}
           onClear={() => { clearHistory(); pushToast('info', 'History cleared'); }} />
       )}
       {tab === 'history' && viewingHistory && (

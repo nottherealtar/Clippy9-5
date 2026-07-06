@@ -146,6 +146,8 @@ services:
       # exact hole the backend loopback binding closes. Same CLIPPYME_BIND
       # override applies.
       - "${CLIPPYME_BIND:-127.0.0.1}:5175:5175"
+    environment:
+      - CLIPPYME_API_URL=http://backend:8000
     volumes:
       - ./dashboard:/app
       - /app/node_modules

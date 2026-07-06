@@ -12,7 +12,7 @@ import { detectPipelineStep } from '../lib/pipelineStep';
  *   onResult: (result: object) => void,
  *   onCompleted: (data: object) => void,
  *   onCancelled: () => void,
- *   onFailed: (errorMsg: string) => void,
+ *   onFailed: (data: { status?: string, logs?: string[], error?: string }) => void,
  *   onProgress: (logs: string[], step: string | null) => void,
  * }} params
  */
@@ -62,10 +62,12 @@ export function useJobPolling({
           onCancelled();
           return;
         } else if (data.status === 'failed') {
-          const errorMsg =
-            data.error ||
-            (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : 'Process failed');
-          onFailed(errorMsg);
+          // Always paint the full backend log tail before we flip to error —
+          // otherwise a fast failure only shows "Initializing engine…" + one line.
+          if (data.logs?.length) {
+            onProgress(data.logs, detectPipelineStep(data.logs));
+          }
+          onFailed(data);
           return;
         } else if (data.logs) {
           onProgress(data.logs, detectPipelineStep(data.logs));

@@ -363,7 +363,11 @@ def _post_with_retries(
                     f"Network error talking to Deepgram after {attempt + 1} attempts: {exc}"
                 ) from exc
             wait = _compute_backoff(attempt + 1, None)
-            print(f"   ⚠️  Deepgram network error ({exc}); retrying in {wait:.1f}s…")
+            print(
+                f"   🔁 Deepgram retry {attempt + 1}/{max_retries} (network) — "
+                f"reconnecting in {wait:.1f}s… (job still running, please wait)",
+                flush=True,
+            )
             time.sleep(wait)
             attempt += 1
             continue
@@ -380,8 +384,9 @@ def _post_with_retries(
             retry_after = response.headers.get("Retry-After")
             wait = _compute_backoff(attempt + 1, retry_after)
             print(
-                f"   ⚠️  Deepgram HTTP {response.status_code}; retrying in {wait:.1f}s "
-                f"(attempt {attempt + 1}/{max_retries})…"
+                f"   🔁 Deepgram retry {attempt + 1}/{max_retries} (HTTP {response.status_code}) — "
+                f"waiting {wait:.1f}s… (job still running, please wait)",
+                flush=True,
             )
             time.sleep(wait)
             attempt += 1

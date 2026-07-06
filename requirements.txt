@@ -38,6 +38,12 @@ Pillow>=12.2.0,<13
 requests>=2.32,<3
 opencv-python==4.13.0.92
 psutil==7.0.0
+# IANA tz database for zoneinfo on Windows (without this, publish scheduling
+# rejects Europe/Rome and other common timezones).
+tzdata>=2024.1
+# IANA tz database for zoneinfo on Windows (without this, available_timezones()
+# is empty and publish scheduling rejects Europe/Rome etc.).
+tzdata>=2024.1
 # Fallback repair library for Gemini viral-detection JSON parsing
 # (level 3 of the gemini_parser.py chain). Pure Python, no native deps.
 # If throughput becomes a bottleneck, `fast-json-repair` (Rust-based,

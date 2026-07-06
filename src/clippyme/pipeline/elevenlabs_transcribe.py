@@ -203,7 +203,11 @@ def _post_with_retries(
                     f"Network error talking to ElevenLabs after {attempt + 1} attempts: {exc}"
                 ) from exc
             wait = _compute_backoff(attempt + 1, None)
-            print(f"   ⚠️  ElevenLabs network error ({exc}); retrying in {wait:.1f}s…")
+            print(
+                f"   🔁 ElevenLabs retry {attempt + 1}/{max_retries} (network) — "
+                f"reconnecting in {wait:.1f}s… (job still running, please wait)",
+                flush=True,
+            )
             time.sleep(wait)
             attempt += 1
             continue
@@ -217,8 +221,9 @@ def _post_with_retries(
                 session = _get_session()
             wait = _compute_backoff(attempt + 1, response.headers.get("Retry-After"))
             print(
-                f"   ⚠️  ElevenLabs HTTP {response.status_code}; retrying in {wait:.1f}s "
-                f"(attempt {attempt + 1}/{max_retries})…"
+                f"   🔁 ElevenLabs retry {attempt + 1}/{max_retries} (HTTP {response.status_code}) — "
+                f"waiting {wait:.1f}s… (job still running, please wait)",
+                flush=True,
             )
             time.sleep(wait)
             attempt += 1

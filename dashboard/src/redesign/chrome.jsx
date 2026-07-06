@@ -5,6 +5,7 @@ import logoMark from './logo-mark.png';
 export function TopNav({ tab, setTab, busy }) {
   const tabs = [
     { id: 'create', label: 'Create', icon: 'wand-sparkles' },
+    { id: 'autopost', label: 'Auto Post', icon: 'calendar-clock' },
     { id: 'history', label: 'History', icon: 'clock' },
     { id: 'settings', label: 'Settings', icon: 'settings' },
   ];

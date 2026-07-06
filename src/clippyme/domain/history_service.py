@@ -72,11 +72,18 @@ def scan_history(output_dir: str) -> List[dict]:
                         )
                 dir_mtime = os.path.getmtime(job_dir)
                 cost_analysis = data.get("cost_analysis") or {}
+                from clippyme.domain.job_recovery import history_status, inspect_job_dir
+                plan = inspect_job_dir(job_dir, entry)
+                status = history_status(job_dir)
                 results.append(
                     {
                         "jobId": entry,
                         "timestamp": int(dir_mtime * 1000),
                         "clipCount": len(clip_files),
+                        "totalClips": plan.total_clips or len(clips),
+                        "status": status,
+                        "recoveryPhase": plan.phase if plan.can_retry or status == "partial" else None,
+                        "recoverySummary": plan.summary() if plan.can_retry or status == "partial" else None,
                         "clips": clip_files,
                         "cost": cost_analysis.get("total_cost"),
                         "source": os.path.basename(meta_files[0])

@@ -35,6 +35,9 @@ const cspPlugin = () => ({
   },
 })
 
+// Docker Compose uses the internal hostname `backend`; native Windows/macOS dev uses localhost.
+const apiTarget = process.env.CLIPPYME_API_URL || 'http://127.0.0.1:8000'
+
 export default defineConfig({
   plugins: [tailwindcss(), react(), cspPlugin()],
   resolve: {
@@ -67,19 +70,19 @@ export default defineConfig({
     ],
     proxy: {
       '/api': {
-        target: 'http://backend:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
       '/videos': {
-        target: 'http://backend:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
       '/thumbnails': {
-        target: 'http://backend:8000',
+        target: apiTarget,
         changeOrigin: true,
       },
       '/fonts': {
-        target: 'http://backend:8000',
+        target: apiTarget,
         changeOrigin: true,
       }
     }

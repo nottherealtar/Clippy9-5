@@ -5,6 +5,7 @@ data (URL, upload path, instructions, language) into the argv of a spawned
 `python -m clippyme.pipeline.main` subprocess. Its argv-injection guard and
 input validation are security-relevant, so they get explicit coverage.
 """
+import sys
 import pytest
 
 from clippyme.domain.job_results import build_main_cmd, MAX_INSTRUCTIONS_LEN
@@ -14,7 +15,7 @@ from clippyme.domain.job_results import build_main_cmd, MAX_INSTRUCTIONS_LEN
 
 def test_url_job_builds_expected_argv():
     cmd = build_main_cmd(url="https://youtu.be/abc", output_dir="output")
-    assert cmd[:4] == ["python", "-u", "-m", "clippyme.pipeline.main"]
+    assert cmd[:4] == [sys.executable, "-u", "-m", "clippyme.pipeline.main"]
     assert "-u" in cmd and "https://youtu.be/abc" in cmd
     assert cmd[cmd.index("-o") + 1] == "output"
 

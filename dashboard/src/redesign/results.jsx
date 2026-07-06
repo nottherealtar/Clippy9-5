@@ -2,7 +2,7 @@
 // download + publish + captions) and multi-select for batch actions.
 import { useState } from 'react';
 import { Icon, Btn, Badge } from './primitives';
-import { clipPreviewSrc, fmtDuration, downloadClip, exportClip } from './realApi';
+import { clipPreviewSrc, clipCoverSrc, fmtDuration, downloadClip, exportClip } from './realApi';
 
 // 'object' kept as a legacy alias of 'subject' (FrameShift face-first) so a clip
 // whose metadata still says 'object' renders the right badge.
@@ -43,7 +43,8 @@ function ClipCard({ clip, index, jobId, state, preselections, onUpdate, onEdit, 
       <div className="clip-media" style={{ padding: 0, background: '#000' }}>
         {/* Captions are burned into the pixels by the subtitle layer — no separate text track exists. */}
         {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-        <video src={clipPreviewSrc(clip, state)} controls={!selectMode} playsInline preload="metadata"
+        <video src={clipPreviewSrc(clip, state)} poster={clipCoverSrc(clip) || undefined}
+          controls={!selectMode} playsInline preload="metadata"
           style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }} />
         <div className="clip-top" style={{ padding: 10 }}>
           <span className="score"><Icon n="flame" style={{ width: 12, height: 12 }} />{score}</span>

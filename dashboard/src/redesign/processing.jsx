@@ -1,12 +1,13 @@
 // ClippyMe redesign — ProcessingView wired to real polling: live logs, a
 // vertical pipeline driven by the detected step, and real clips streaming in
 // as partial results arrive.
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon, Btn, Badge, Panel } from './primitives';
 import { Hero } from './chrome';
 import { PIPE } from './data';
 import { pipelineStepMeta } from '../lib/pipelineStep';
-import { clipVideoSrc, fmtDuration } from './realApi';
+import { parseTranscriptionRetryStatus } from '../lib/retryStatus';
+import { clipVideoSrc, clipCoverSrc, fmtDuration } from './realApi';
 
 // Map the backend's detected pipeline step to an approximate % + pipe index.
 // (The backend streams logs, not a numeric %, so this is a visual estimate.)
@@ -18,12 +19,74 @@ const STEP_INFO = {
   processing: { pct: 80, idx: 3 },
 };
 
+function BatchStrip({ jobs = [] }) {
+  if (!jobs.length) return null;
+  return (
+    <div className="batch-strip">
+      {jobs.map((j) => {
+        const cls = 'batch-row' + (j.status === 'done' ? ' done' : j.status === 'failed' ? ' failed' : '');
+        const speed = j.status === 'downloading' && j.downloadSpeed
+          ? `${j.downloadSpeed}${j.downloadPct != null ? ` · ${j.downloadPct.toFixed(0)}%` : ''}`
+          : j.status === 'done' ? 'done'
+            : j.status === 'failed' ? 'failed'
+              : j.status === 'working' ? (j.step || 'working')
+                : 'queued';
+        return (
+          <div key={j.id} className={cls}>
+            <span className="bl">{j.label}</span>
+            <span className="bp">{j.status === 'downloading' && j.downloadEta ? j.downloadEta : ''}</span>
+            <span className="bs">{speed}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function MiniClip({ clip }) {
+  const [videoReady, setVideoReady] = useState(false);
+  const [retryBust, setRetryBust] = useState(0);
+  const [failed, setFailed] = useState(false);
+  const poster = clipCoverSrc(clip, retryBust);
+  const src = clipVideoSrc(clip, retryBust);
+
+  useEffect(() => {
+    setVideoReady(false);
+    setFailed(false);
+    setRetryBust(0);
+  }, [clip?.video_url, clip?.original_index]);
+
+  const onVideoError = () => {
+    // During live rendering the mp4 may not be readable yet — retry a few times.
+    if (retryBust < 3) {
+      window.setTimeout(() => setRetryBust(Date.now()), 1500);
+    } else {
+      setFailed(true);
+    }
+  };
+
   return (
     <div className="clip fade-in" style={{ cursor: 'default' }}>
       <div className="clip-media" style={{ padding: 0, background: '#000' }}>
-        <video src={clipVideoSrc(clip)} muted playsInline preload="metadata"
-          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+        {poster && (
+          <img src={poster} alt="" aria-hidden="true"
+            className={'clip-poster' + (videoReady ? ' clip-poster--hide' : '')}
+            style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }} />
+        )}
+        {!failed ? (
+          <video src={src} poster={poster || undefined} muted playsInline preload="auto"
+            onLoadedData={() => setVideoReady(true)}
+            onError={onVideoError}
+            style={{
+              position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover',
+              zIndex: 0, opacity: videoReady || poster ? 1 : 0,
+            }} />
+        ) : (
+          <div className="clip-preview-fallback" style={{ position: 'absolute', inset: 0, zIndex: 0 }}>
+            <Icon n="film" />
+            <span>Preview loading…</span>
+          </div>
+        )}
         <div className="clip-top" style={{ padding: 8 }}>
           <span className="score" style={{ fontSize: 12, padding: '3px 7px' }}>{Math.round(clip.viral_score || 0)}</span>
         </div>
@@ -33,10 +96,23 @@ function MiniClip({ clip }) {
   );
 }
 
-export function ProcessingView({ media, status, logs = [], step, clips = [], onCancel, onRetry,
+export function ProcessingView({ media, status, logs = [], step, clips = [], batchJobs = [], onCancel, onRetry,
                                  paused = false, onPause, onResume, onStop, opts = {} }) {
   const logRef = useRef(null);
-  useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; });
+  const stickRef = useRef(true);
+
+  const onLogScroll = () => {
+    const el = logRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickRef.current = dist < 48;
+  };
+
+  useEffect(() => {
+    const el = logRef.current;
+    if (!el || !stickRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [logs]);
 
   const failed = status === 'error';
   const info = STEP_INFO[step] || STEP_INFO.queued;
@@ -54,6 +130,7 @@ export function ProcessingView({ media, status, logs = [], step, clips = [], onC
   // fallback, gemini model vs no-AI TextTiling, reframe mode, local-vs-URL
   // source) — falls back to the static PIPE meta for steps we can't resolve.
   const metaOverride = pipelineStepMeta(logs, { ...opts, mediaType: media?.type });
+  const retryStatus = parseTranscriptionRetryStatus(logs);
   // The reframe step name hard-codes "9:16"; reflect the real output aspect so
   // a 1:1 / 16:9 job isn't mislabelled.
   const nameOverride = { reframe: `Reframe ${opts.aspect || '9:16'}` };
@@ -113,12 +190,25 @@ export function ProcessingView({ media, status, logs = [], step, clips = [], onC
                 <Btn variant="ghost" size="sm" icon="x" onClick={onCancel}>{failed ? 'Start over' : 'Discard'}</Btn>
               </span>
             </div>
-            <div className="log" ref={logRef}>
+            {media?.type === 'batch' && batchJobs.length > 0 && (
+              <BatchStrip jobs={batchJobs} />
+            )}
+            {retryStatus && !failed && (
+              <div className="retry-banner" role="status">
+                <Icon n="clock" />
+                <span>{retryStatus.message}</span>
+              </div>
+            )}
+            <div className="log" ref={logRef} onScroll={onLogScroll}>
               {logs.length === 0 && <div className="ln"><span className="ts">··</span> <span>waiting for the worker…</span></div>}
               {logs.map((l, i) => (
                 <div key={i} className="ln">
-                  <span className={/error/i.test(l) ? '' : /✓|done|complete|found/i.test(l) ? 'ok' : ''}
-                    style={/error/i.test(l) ? { color: 'var(--danger)' } : undefined}>{l}</span>
+                  <span className={
+                    /error|failed|❌/i.test(l) ? '' :
+                    /🔁|retry|fallback|falling back/i.test(l) ? 'retry' :
+                    /✓|done|complete|found/i.test(l) ? 'ok' : ''
+                  }
+                    style={/error|failed|❌/i.test(l) ? { color: 'var(--danger)' } : undefined}>{l}</span>
                 </div>
               ))}
               {!failed && <div><span className="cursor"></span></div>}

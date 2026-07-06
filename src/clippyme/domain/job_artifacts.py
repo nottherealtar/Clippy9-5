@@ -8,6 +8,39 @@ from typing import Tuple
 
 logger = logging.getLogger("clippyme")
 
+MANIFEST_FILENAME = "job_manifest.json"
+
+
+def save_job_manifest(job_dir: str, data: dict) -> None:
+    """Persist submit-time job params so smart retry can rebuild the CLI."""
+    os.makedirs(job_dir, exist_ok=True)
+    path = os.path.join(job_dir, MANIFEST_FILENAME)
+    tmp_path = path + ".tmp"
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def load_job_manifest(job_dir: str) -> dict:
+    path = os.path.join(job_dir, MANIFEST_FILENAME)
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
 
 def find_job_metadata_path(job_id: str, output_dir: str) -> str:
     """Return the path to a job's ``*_metadata.json`` file.

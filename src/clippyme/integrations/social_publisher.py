@@ -342,6 +342,70 @@ class SmartScheduler:
 # ---------------------------------------------------------------------------
 
 
+def find_cover_path(clip_path: str) -> Optional[str]:
+    """Return the auto-selected cover JPEG saved alongside the clip, if any."""
+    cover = os.path.splitext(clip_path)[0] + "_cover.jpg"
+    return cover if os.path.isfile(cover) else None
+
+
+def normalize_youtube_tags(tags: list[str] | None) -> list[str]:
+    """Strip # prefixes and enforce YouTube's combined 500-char tag budget."""
+    out: list[str] = []
+    total = 0
+    for raw in tags or []:
+        tag = str(raw or "").strip().lstrip("#")
+        if not tag or len(tag) > 100:
+            continue
+        if tag.lower() in {t.lower() for t in out}:
+            continue
+        if total + len(tag) > 500:
+            break
+        out.append(tag)
+        total += len(tag)
+    return out
+
+
+def enrich_platform_targets(
+    platform_targets: list[dict],
+    *,
+    first_comment: Optional[str] = None,
+    youtube_tags: Optional[list[str]] = None,
+    instagram_share_to_feed: bool = True,
+    per_platform_content: Optional[dict[str, str]] = None,
+) -> list[dict]:
+    """Merge Zernio platformSpecificData onto each target (pure, host-testable)."""
+    comment = (first_comment or "").strip()
+    tags = normalize_youtube_tags(youtube_tags)
+    per_platform = per_platform_content or {}
+    enriched: list[dict] = []
+    for entry in platform_targets:
+        target = dict(entry)
+        psd = dict(target.get("platformSpecificData") or {})
+        platform = target.get("platform")
+
+        if comment:
+            psd["firstComment"] = comment[:10000]
+
+        custom = (per_platform.get(platform) or "").strip()
+        if custom:
+            psd["customContent"] = custom[:2200]
+
+        if platform == "instagram":
+            psd["shareToFeed"] = bool(instagram_share_to_feed)
+
+        if platform == "youtube":
+            if tags:
+                psd["tags"] = tags
+            yt_title = (per_platform.get("youtube_title") or "").strip()
+            if yt_title:
+                psd["title"] = yt_title[:100]
+
+        if psd:
+            target["platformSpecificData"] = psd
+        enriched.append(target)
+    return enriched
+
+
 def _validate_platform_targets(platform_targets: list[dict]) -> None:
     if not platform_targets:
         raise ValueError("at least one platform target is required")
@@ -367,6 +431,11 @@ def publish_clip(
     tiktok_settings: Optional[dict] = None,
     scheduler: Optional[SmartScheduler] = None,
     start_date: Optional[str] = None,
+    first_comment: Optional[str] = None,
+    use_cover_thumbnail: bool = True,
+    youtube_tags: Optional[list[str]] = None,
+    instagram_share_to_feed: bool = True,
+    per_platform_content: Optional[dict[str, str]] = None,
 ) -> dict:
     """Publish a single clip via Zernio.
 
@@ -513,17 +582,56 @@ def publish_clip(
         raise ZernioError(f"malformed presign response (missing {exc})") from exc
     client.upload_to_presigned(upload_url, clip_path, content_type="video/mp4")
 
+    # Optional cover thumbnail — pipeline saves {clip}_cover.jpg next to the mp4.
+    thumb_url: Optional[str] = None
+    if use_cover_thumbnail:
+        cover_path = find_cover_path(clip_path)
+        if cover_path:
+            try:
+                cover_size = os.path.getsize(cover_path)
+            except OSError:
+                cover_size = None
+            try:
+                cover_presign = client.presign_upload(
+                    os.path.basename(cover_path),
+                    content_type="image/jpeg",
+                    size_bytes=cover_size,
+                )
+                cover_upload_url = cover_presign["uploadUrl"]
+                thumb_url = cover_presign["publicUrl"]
+                client.upload_to_presigned(cover_upload_url, cover_path, content_type="image/jpeg")
+                logger.info("publish_clip: uploaded cover thumbnail for %s", os.path.basename(clip_path))
+            except (ZernioError, KeyError, TypeError) as exc:
+                logger.warning("publish_clip: cover thumbnail upload skipped: %s", exc)
+                thumb_url = None
+
     # 3. Create post
-    media_items = [{"type": "video", "url": public_url}]
+    media_items: list[dict[str, Any]] = [{"type": "video", "url": public_url}]
+    if thumb_url:
+        media_items[0]["instagramThumbnail"] = thumb_url
+        media_items[0]["thumbnail"] = thumb_url
+
+    merged_tiktok = dict(tiktok_settings or {})
+    if thumb_url:
+        merged_tiktok["video_cover_image_url"] = thumb_url
+
+    platforms_payload = enrich_platform_targets(
+        platform_targets,
+        first_comment=first_comment,
+        youtube_tags=youtube_tags,
+        instagram_share_to_feed=instagram_share_to_feed,
+        per_platform_content=per_platform_content,
+    )
+
     response = client.create_post(
         content=effective_content,
         title=title,
         media_items=media_items,
-        platforms=platform_targets,
+        platforms=platforms_payload,
         scheduled_for=final_scheduled_for,
         timezone=timezone,
         publish_now=publish_now,
-        tiktok_settings=tiktok_settings,
+        tiktok_settings=merged_tiktok or None,
     )
 
     # 4. Extract post id (response shape varies)

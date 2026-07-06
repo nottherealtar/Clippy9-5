@@ -22,7 +22,6 @@ installed at all (smartcut.py has its own FFmpeg fallback).
 import asyncio
 import contextlib
 import errno
-import fcntl
 import hashlib
 import json
 import logging
@@ -34,6 +33,11 @@ import tempfile
 import time
 import urllib.request
 from typing import Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +285,10 @@ def _update_lock() -> Iterator[bool]:
     """
     os.makedirs(UPDATE_DIR, exist_ok=True)
     lock_path = os.path.join(UPDATE_DIR, ".update.lock")
+    if fcntl is None:
+        # No POSIX flock on Windows — proceed without cross-process locking.
+        yield True
+        return
     fd = None
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)

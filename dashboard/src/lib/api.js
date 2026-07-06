@@ -6,11 +6,38 @@ async function throwFromResponse(res) {
   let msg = text;
   try {
     const parsed = JSON.parse(text);
-    msg = typeof parsed.detail === 'string' ? parsed.detail : JSON.stringify(parsed.detail);
+    msg = formatApiDetail(parsed.detail) || text;
   } catch {
     // Non-JSON body: fall back to the raw text captured above.
   }
   throw new Error(msg || `HTTP ${res.status}`);
+}
+
+/** Turn a FastAPI ``detail`` (string | object | validation array) into text. */
+export function formatApiDetail(detail) {
+  if (detail == null) return '';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          const loc = Array.isArray(item.loc) ? item.loc.join('.') : '';
+          const msg = item.msg || item.message || JSON.stringify(item);
+          return loc ? `${loc}: ${msg}` : String(msg);
+        }
+        return String(item);
+      })
+      .join('; ');
+  }
+  if (typeof detail === 'object') {
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return String(detail);
+    }
+  }
+  return String(detail);
 }
 
 export async function pollJob(jobId) {

@@ -30,7 +30,7 @@ function relTime(ts) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-export function HistoryView({ history, availableIds, onOpen, onDelete, onClear }) {
+export function HistoryView({ history, availableIds, onOpen, onDelete, onClear, onRetry }) {
   if (!history.length) {
     return (
       <div className="container narrow fade-in">
@@ -59,8 +59,13 @@ export function HistoryView({ history, availableIds, onOpen, onDelete, onClear }
           // An entry whose files were wiped by a rebuild is shown muted + flagged
           // "files removed" instead of looking clickable and dead-ending.
           const onDisk = !availableIds || availableIds.has(h.jobId);
-          const ok = h.status === 'complete' && onDisk;
+          const partial = h.status === 'partial' || h.status === 'interrupted';
+          const ok = (h.status === 'complete' || (partial && (h.clipCount ?? 0) > 0)) && onDisk;
+          const canRetry = onRetry && onDisk && (h.status === 'partial' || h.status === 'interrupted');
           const removed = !!availableIds && !availableIds.has(h.jobId);
+          const clipLabel = h.totalClips && h.totalClips > (h.clipCount ?? 0)
+            ? `${h.clipCount || 0}/${h.totalClips} clips`
+            : `${h.clipCount || 0} clips`;
           return (
             <div className="hrow" key={h.jobId}
               role={ok ? 'button' : undefined} tabIndex={ok ? 0 : undefined}
@@ -75,14 +80,23 @@ export function HistoryView({ history, availableIds, onOpen, onDelete, onClear }
                 <div className="hm">
                   <Icon n={h.sourceType === 'url' ? 'globe' : 'file-video'} style={{ width: 11, height: 11, verticalAlign: '-1px', marginRight: 5 }} />
                   {removed ? 'Files removed (rebuild/cleanup) · delete to dismiss'
-                    : `${h.clipCount || 0} clips${h.cost != null ? ` · $${Number(h.cost).toFixed(2)}` : ''} · ${relTime(h.timestamp)}`}
+                    : `${clipLabel}${h.cost != null ? ` · $${Number(h.cost).toFixed(2)}` : ''}${h.recoverySummary ? ` · ${h.recoverySummary}` : ''} · ${relTime(h.timestamp)}`}
                 </div>
               </div>
               <div className="hr">
                 {removed ? <Badge tone="out" icon="triangle-alert">unavailable</Badge>
                   : h.status === 'complete' ? <Badge tone="teal" icon="check">complete</Badge>
-                    : h.status === 'error' ? <Badge tone="danger" icon="triangle-alert">error</Badge>
-                      : <Badge tone="amber" icon="clock">{h.status || 'pending'}</Badge>}
+                    : h.status === 'partial' ? <Badge tone="amber" icon="clock">partial</Badge>
+                      : h.status === 'interrupted' ? <Badge tone="amber" icon="wand-sparkles">interrupted</Badge>
+                        : h.status === 'error' ? <Badge tone="danger" icon="triangle-alert">error</Badge>
+                          : <Badge tone="amber" icon="clock">{h.status || 'pending'}</Badge>}
+                {canRetry && (
+                  <button type="button" className="mini" title={h.recoverySummary || 'Smart retry'}
+                    aria-label="Retry job"
+                    onClick={(e) => { e.stopPropagation(); onRetry(h); }}>
+                    <Icon n="wand-sparkles" />
+                  </button>
+                )}
                 <button type="button" className="mini" title="Delete" aria-label="Delete job" onClick={(e) => { e.stopPropagation(); onDelete(h.jobId); }}><Icon n="trash-2" /></button>
                 {ok && <Icon n="chevron-right" style={{ width: 18, height: 18, color: 'var(--fg-4)' }} />}
               </div>
@@ -129,6 +143,10 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
   const [zernio, setZernioState] = useState(null);
   const [zKey, setZKey] = useState('');
   const [accts, setAccts] = useState({ tiktok: '', instagram: '', youtube: '' });
+  const [pubFirstComment, setPubFirstComment] = useState('');
+  const [pubUseCover, setPubUseCover] = useState(true);
+  const [pubAutoCaption, setPubAutoCaption] = useState(true);
+  const [pubShareToFeed, setPubShareToFeed] = useState(true);
   const [cookies, setCookies] = useState(!!cookiesConfigured);
   const [logoOn, setLogoOn] = useState(false);
   const [fonts, setFonts] = useState([]);
@@ -162,7 +180,15 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
       if (c.GEMINI_MODEL) setModel(c.GEMINI_MODEL);
       loadModels();
     }).catch(() => {});
-    getZernio().then((z) => { setZernioState(z); if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', ...z.accounts }); }).catch(() => {});
+    getZernio().then((z) => {
+      setZernioState(z);
+      if (z.accounts) setAccts({ tiktok: '', instagram: '', youtube: '', ...z.accounts });
+      const pd = z.publish_defaults || {};
+      setPubFirstComment(pd.first_comment || '');
+      setPubUseCover(pd.use_cover_thumbnail !== false);
+      setPubAutoCaption(pd.auto_caption !== false);
+      setPubShareToFeed(pd.instagram_share_to_feed !== false);
+    }).catch(() => {});
     cookiesStatus().then((s) => setCookies(!!s.configured)).catch(() => {});
     logoStatus().then((s) => setLogoOn(!!s.configured)).catch(() => {});
     listFonts().then(({ fonts: f }) => setFonts(Array.isArray(f) ? f : [])).catch(() => {});
@@ -176,7 +202,15 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
 
   const saveZernioCfg = async () => {
     try {
-      const payload = { accounts: accts };
+      const payload = {
+        accounts: accts,
+        publish_defaults: {
+          first_comment: pubFirstComment,
+          use_cover_thumbnail: pubUseCover,
+          auto_caption: pubAutoCaption,
+          instagram_share_to_feed: pubShareToFeed,
+        },
+      };
       if (zKey.trim()) payload.api_key = zKey.trim();
       const z = await saveZernio(payload);
       setZernioState(z); setZKey('');
@@ -307,6 +341,23 @@ export function SettingsView({ apiKey, onApiKey, cookiesConfigured, onCookiesCha
           <div style={{ display: 'flex', gap: 10 }}>
             <Btn variant="secondary" size="sm" icon="rss" onClick={discover}>Discover from Zernio</Btn>
             <Btn variant="primary" size="sm" icon="check" onClick={saveZernioCfg}>Save</Btn>
+          </div>
+          <div style={{ borderTop: '1px solid var(--line-1)', paddingTop: 12, marginTop: 4 }}>
+            <div className="cm-small" style={{ marginBottom: 8 }}>Default publish options (applied in the Publish modal)</div>
+            <textarea className="ta" rows="2" value={pubFirstComment} onChange={(e) => setPubFirstComment(e.target.value)}
+              placeholder="Default first comment (optional)" style={{ marginBottom: 8 }} />
+            <div className="opt" style={{ borderBottom: 0, padding: '8px 0' }}>
+              <div className="otxt"><div className="ot">Auto cover thumbnail</div></div>
+              <div className="r"><Switch on={pubUseCover} onChange={setPubUseCover} /></div>
+            </div>
+            <div className="opt" style={{ borderBottom: 0, padding: '8px 0' }}>
+              <div className="otxt"><div className="ot">Auto caption + hashtags</div></div>
+              <div className="r"><Switch on={pubAutoCaption} onChange={setPubAutoCaption} /></div>
+            </div>
+            <div className="opt" style={{ borderBottom: 0, padding: '8px 0' }}>
+              <div className="otxt"><div className="ot">Instagram share to feed</div></div>
+              <div className="r"><Switch on={pubShareToFeed} onChange={setPubShareToFeed} /></div>
+            </div>
           </div>
         </div>
       </Panel>

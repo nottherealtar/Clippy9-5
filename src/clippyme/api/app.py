@@ -47,6 +47,7 @@ from clippyme.api.schemas import (
     ComposeRequest,
     ConfigUpdateRequest,
     EditAIRequest,
+    CaptionAIRequest,
     ProcessRequest,
     PublishRequest,
     ReframeRequest,
@@ -74,7 +75,9 @@ from clippyme.storage.config_store import (
 from clippyme.domain.job_artifacts import (
     relocate_root_job_artifacts,
     load_job_metadata,
+    save_job_manifest,
 )
+from clippyme.domain.job_recovery import build_retry_cmd, inspect_job_dir
 from clippyme.domain.job_worker import make_workers, enqueue_output
 from clippyme.pipeline.gemini_service import list_available_models
 from clippyme.domain.history_service import scan_history, is_valid_job_id
@@ -136,11 +139,13 @@ async def lifespan(app: FastAPI):
     # Failures are non-fatal — smartcut has an FFmpeg fallback path.
     from clippyme.integrations.auto_editor_updater import background_updater_loop
     ae_updater_task = asyncio.create_task(background_updater_loop())
+    from clippyme.domain.auto_post_service import auto_post_worker_loop
+    auto_post_task = asyncio.create_task(auto_post_worker_loop(OUTPUT_DIR))
     yield
     # Cancel ALL background tasks on shutdown — not just the updater. Leaving
     # the worker/cleanup loops pending blocks uvicorn's graceful exit and logs
     # "Task was destroyed but it is pending!" tracebacks.
-    _bg_tasks = (worker_task, cleanup_task, ae_updater_task)
+    _bg_tasks = (worker_task, cleanup_task, ae_updater_task, auto_post_task)
     for _t in _bg_tasks:
         _t.cancel()
     for _t in _bg_tasks:
@@ -289,8 +294,14 @@ async def run_job(job_id, job_data):
 
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
+    jobs[job_id]['logs'].append(f"Interpreter: {cmd[0]}")
     jobs[job_id]['process'] = None  # Will hold Popen reference for cancel
     logger.info("Executing job %s: %s", job_id, ' '.join(cmd))
+
+    # Windows pipes + emoji logs need UTF-8; without this the child can crash
+    # before the first line reaches the UI.
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUTF8", "1")
 
     try:
         process = subprocess.Popen(
@@ -320,6 +331,11 @@ async def run_job(job_id, job_data):
             if partial:
                 jobs[job_id]['result'] = partial
 
+        # Drain any buffered stdout before we mark the job terminal — on Windows
+        # a fast exit can otherwise leave the pipe unread and the UI shows only
+        # "exit code 1" with no traceback.
+        await asyncio.to_thread(t_log.join, 15)
+
         returncode = process.returncode
 
         if jobs[job_id]['status'] == 'cancelled':
@@ -348,6 +364,19 @@ async def run_job(job_id, job_data):
         else:
             jobs[job_id]['status'] = 'failed'
             jobs[job_id]['logs'].append(f"Process failed with exit code {returncode}")
+            # If the subprocess produced no output at all, surface the command
+            # so a wrong-PYTHON / missing-module failure is debuggable in the UI.
+            worker_lines = {
+                f"Job {job_id} queued.",
+                "Job started by worker.",
+                f"Interpreter: {cmd[0]}",
+            }
+            if not any(l not in worker_lines and not l.startswith("Process failed")
+                       for l in jobs[job_id]['logs']):
+                jobs[job_id]['logs'].append(
+                    "No pipeline output captured — check that the API is running "
+                    "from the project .venv (Python 3.11) and retry."
+                )
             
     except Exception as e:
         jobs[job_id]['status'] = 'failed'
@@ -497,6 +526,20 @@ async def process_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    save_job_manifest(job_output_dir, {
+        "job_id": job_id,
+        "url": url,
+        "upload_path": input_path,
+        "instructions": instructions,
+        "reframe_mode": reframe_mode,
+        "aspect": aspect,
+        "language": language,
+        "no_zoom": no_zoom,
+        "skip_analysis": skip_analysis,
+        "model": model,
+        "cookies_path": os.path.join("data", "cookies.txt") if url else None,
+    })
+
     # Enqueue Job
     jobs[job_id] = {
         'status': 'queued',
@@ -555,6 +598,19 @@ async def batch_process(req: BatchRequest, request: Request):
             # made it into `jobs` — clean it up so a bad URL can't orphan a dir.
             await asyncio.to_thread(shutil.rmtree, job_output_dir, True)
             raise HTTPException(status_code=400, detail=str(exc))
+
+        save_job_manifest(job_output_dir, {
+            "job_id": job_id,
+            "url": url,
+            "instructions": req.instructions,
+            "reframe_mode": req.reframe_mode,
+            "aspect": getattr(req, "aspect", None),
+            "language": getattr(req, "language", None),
+            "no_zoom": bool(getattr(req, "no_zoom", False)),
+            "skip_analysis": bool(getattr(req, "skip_analysis", False)),
+            "model": getattr(req, "model", None),
+            "cookies_path": os.path.join("data", "cookies.txt"),
+        })
 
         env = os.environ.copy()
         env["GEMINI_API_KEY"] = api_key
@@ -1053,6 +1109,53 @@ async def edit_clip_ai(
     return {"drop_ranges": result["drops"], "explanation": result["explanation"]}
 
 
+@app.post("/api/caption-ai/{job_id}/{clip_index}")
+async def caption_clip_ai(
+    job_id: str,
+    clip_index: int,
+    req: CaptionAIRequest,
+    request: Request,
+    api_key: Optional[str] = Header(None, alias="X-Gemini-Key"),
+):
+    """Generate a platform-aware social post caption with hashtags for a clip."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    try:
+        _meta_path, data = load_job_metadata(job_id, OUTPUT_DIR)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    clips = data.get("shorts", [])
+    if clip_index < 0 or clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip = clips[clip_index]
+    start, end = clip.get("start", 0), clip.get("end", 0)
+    duration = round(max(0.0, end - start), 3)
+
+    transcript = data.get("transcript") or {}
+    from clippyme.domain.smartcut import clip_transcript_segments
+    segments = clip_transcript_segments(transcript, start, end)
+
+    cfg = load_persistent_config() or {}
+    key = api_key or os.environ.get("GEMINI_API_KEY") or cfg.get("GEMINI_API_KEY")
+    model = req.model or cfg.get("GEMINI_MODEL") or "gemini-3.5-flash"
+    if not key:
+        raise HTTPException(status_code=400, detail="Gemini API key not configured")
+
+    from clippyme.domain.clip_caption_ai import generate_captions
+    result = await asyncio.to_thread(
+        generate_captions,
+        api_key=key,
+        model=model,
+        segments=segments,
+        clip=clip,
+        clip_duration=duration,
+        platform=req.platform,
+        language=transcript.get("language", "en"),
+    )
+    return result
+
+
 @app.post("/api/reframe/{job_id}/{clip_index}")
 async def reframe_clip(job_id: str, clip_index: int, req: ReframeRequest, request: Request):
     """Switch a clip between reframe modes (auto / subject / disabled) after generation.
@@ -1180,6 +1283,7 @@ async def update_zernio_config(req: ZernioConfigRequest, request: Request):
         api_key=req.api_key,
         accounts=req.accounts,
         timezone=req.timezone,
+        publish_defaults=req.publish_defaults,
     )
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to save Zernio config")
@@ -1296,6 +1400,11 @@ async def publish_clip_endpoint(job_id: str, clip_index: int, req: PublishReques
             timezone=req.timezone or cfg.get("timezone") or "Europe/Rome",
             tiktok_settings=req.tiktok_settings,
             start_date=req.start_date,
+            first_comment=req.first_comment,
+            use_cover_thumbnail=req.use_cover_thumbnail,
+            youtube_tags=req.youtube_tags,
+            instagram_share_to_feed=req.instagram_share_to_feed,
+            per_platform_content=req.per_platform_content,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1332,3 +1441,86 @@ async def restore_job(job_id: str, request: Request):
     jobs[job_id] = job_entry
     logger.info("Restored job %s into memory (%d clips)", job_id, len(job_entry["result"]["clips"]))
     return {"success": True, "status": "completed", "result": job_entry["result"]}
+
+
+@app.get("/api/history/{job_id}/recovery")
+async def history_job_recovery(job_id: str, request: Request):
+    """Describe what a smart retry would do for a job on disk."""
+    require_trusted_config_request(request)
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found on disk")
+    plan = inspect_job_dir(job_dir, job_id)
+    return {
+        "job_id": job_id,
+        "phase": plan.phase,
+        "can_retry": plan.can_retry,
+        "reason": plan.reason,
+        "summary": plan.summary(),
+        "rendered_clips": plan.rendered_clips,
+        "total_clips": plan.total_clips,
+        "resume_from_clip": plan.resume_from_clip,
+    }
+
+
+@app.post("/api/history/{job_id}/retry")
+async def retry_history_job(job_id: str, request: Request):
+    """Smart-retry a failed or partial job using artifacts left on disk."""
+    require_trusted_config_request(request)
+    enforce_rate_limit(request, "process", capacity=20, refill_per_sec=20 / 60)
+    api_key = request.headers.get("X-Gemini-Key")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+    if not is_valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job ID")
+
+    existing = jobs.get(job_id, {})
+    if existing.get("status") in ("processing", "queued", "paused"):
+        raise HTTPException(status_code=409, detail="Job is already running")
+
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    if not os.path.isdir(job_dir):
+        raise HTTPException(status_code=404, detail="Job not found on disk")
+
+    plan = inspect_job_dir(job_dir, job_id)
+    if not plan.can_retry:
+        raise HTTPException(status_code=400, detail=plan.reason)
+
+    try:
+        cmd = build_retry_cmd(plan)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    env = os.environ.copy()
+    env["GEMINI_API_KEY"] = api_key
+
+    jobs[job_id] = {
+        "status": "queued",
+        "logs": [
+            f"Job {job_id} retry queued ({plan.summary()}).",
+        ],
+        "cmd": cmd,
+        "env": env,
+        "output_dir": job_dir,
+    }
+
+    try:
+        job_queue.put_nowait(job_id)
+    except asyncio.QueueFull:
+        del jobs[job_id]
+        raise HTTPException(status_code=429, detail="Server busy. Please try again later.")
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "phase": plan.phase,
+        "summary": plan.summary(),
+        "rendered_clips": plan.rendered_clips,
+        "total_clips": plan.total_clips,
+    }
+
+
+from clippyme.api.auto_post_endpoints import register_auto_post_routes
+register_auto_post_routes(app, OUTPUT_DIR)

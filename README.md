@@ -116,6 +116,8 @@ Swaps the dashboard from the Vite dev server to a static `vite build` served by 
 
 ## Local development (no Docker)
 
+> **Windows, no Docker?** See **[docs/PYTHON_INSTALL_HANDBOOK.md](docs/PYTHON_INSTALL_HANDBOOK.md)** — one-page cheat sheet + full install/troubleshooting guide.
+
 ```bash
 # Backend
 pip install -r requirements.txt

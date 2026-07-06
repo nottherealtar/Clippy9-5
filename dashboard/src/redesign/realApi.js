@@ -5,7 +5,8 @@
 // strictly, and Vite accepts the explicit form unchanged.
 import { getApiUrl } from '../config.js';
 import { apiFetch } from '../lib/apiToken.js';
-import { seedToggles, seedHookParams, seedSubtitleParams, seedLogoParams } from '../lib/seedClipParams.js';
+import { formatApiDetail } from '../lib/api.js';
+import { resolveComposeParams } from '../lib/buildPublishBody.js';
 import { clipDownloadName } from '../lib/clipFilename.js';
 
 export { clipDownloadName };
@@ -29,6 +30,20 @@ function safeResolveUrl(url) {
 
 export function clipVideoSrc(clip, bust) {
   const full = safeResolveUrl(clip?.video_url || '');
+  return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
+}
+
+/** Pipeline cover frame (`{clip}_cover.jpg`) saved next to each rendered mp4. */
+export function clipCoverSrc(clip, bust) {
+  const fromApi = clip?.cover_url;
+  if (fromApi) {
+    const full = safeResolveUrl(fromApi);
+    return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
+  }
+  const video = clip?.video_url || '';
+  if (!video.endsWith('.mp4')) return '';
+  const cover = video.replace(/\.mp4(\?.*)?$/, '_cover.jpg');
+  const full = safeResolveUrl(cover);
   return bust ? `${full}${full.includes('?') ? '&' : '?'}v=${bust}` : full;
 }
 
@@ -89,7 +104,7 @@ export async function composeClip(jobId, index, { toggles, hook_params, subtitle
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    throw new Error(formatApiDetail(err.detail) || `HTTP ${res.status}`);
   }
   return res.json(); // { composed_url }
 }
@@ -104,7 +119,21 @@ export async function editClipAI(jobId, index, instruction, model) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    throw new Error(formatApiDetail(err.detail) || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/** AI social caption with hashtags for publish. platform: tiktok|instagram|youtube|all */
+export async function generateCaption(jobId, index, { platform = 'tiktok', model } = {}) {
+  const res = await apiFetch(getApiUrl(`/api/caption-ai/${jobId}/${index}`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ platform, ...(model ? { model } : {}) }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(formatApiDetail(err.detail) || `HTTP ${res.status}`);
   }
   return res.json();
 }
@@ -121,19 +150,16 @@ export async function getClipTranscript(jobId, index) {
 // is active for it, otherwise grabbing the raw clip. Shared by the per-clip
 // download button and bulk export. Returns 'composed' | 'raw'.
 export async function exportClip(jobId, index, clip, state, preselections) {
-  const toggles = state?.toggles ?? seedToggles(preselections);
+  const { toggles, hookParams, subtitleParams, logoParams, gradeParams } =
+    resolveComposeParams(clip, state, preselections);
   const any = Object.values(toggles || {}).some(Boolean);
   if (!any) { downloadClip(clip, index); return 'raw'; }
-  const hook = state?.hookParams ?? seedHookParams(clip, preselections);
-  const subs = state?.subtitleParams ?? seedSubtitleParams(preselections);
-  const logo = state?.logoParams ?? seedLogoParams(preselections);
-  const grade = state?.gradeParams ?? { preset: preselections?.grade?.preset || 'none' };
   const { composed_url } = await composeClip(jobId, index, {
     toggles,
-    hook_params: toggles.hook ? hook : {},
-    subtitle_params: toggles.subtitles ? subs : {},
-    logo_params: toggles.logo ? logo : {},
-    grade_params: toggles.grade ? grade : {},
+    hook_params: toggles.hook ? hookParams : {},
+    subtitle_params: toggles.subtitles ? subtitleParams : {},
+    logo_params: toggles.logo ? logoParams : {},
+    grade_params: toggles.grade ? gradeParams : {},
     drop_ranges: toggles.smartcut ? (state?.dropRanges || []) : [],
   });
   const href = safeResolveUrl(composed_url);
@@ -151,7 +177,7 @@ export async function reframeClip(jobId, index, mode) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const e = new Error(err.detail || `HTTP ${res.status}`);
+    const e = new Error(formatApiDetail(err.detail) || `HTTP ${res.status}`);
     e.status = res.status;
     throw e;
   }
@@ -166,7 +192,7 @@ export async function publishClip(jobId, index, body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    const e = new Error((err.detail || `HTTP ${res.status}`).toString());
+    const e = new Error(formatApiDetail(err.detail) || `HTTP ${res.status}`);
     e.status = res.status;
     throw e;
   }
@@ -187,11 +213,38 @@ export async function restoreJob(jobId) {
 // empty Set on any error (treated as "unknown" → don't disable anything).
 export async function listBackendJobIds() {
   try {
-    const res = await apiFetch(getApiUrl('/api/history'));
-    if (!res.ok) return null;
-    const data = await res.json();
-    return new Set((data.jobs || []).map((j) => j.jobId).filter(Boolean));
+    const jobs = await fetchBackendHistory();
+    return new Set(jobs.map((j) => j.jobId).filter(Boolean));
   } catch { return null; }
+}
+
+/** Jobs that finished on disk (source of truth when localStorage is stale). */
+export async function fetchBackendHistory() {
+  const res = await apiFetch(getApiUrl('/api/history'));
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.jobs || [];
+}
+
+export async function deleteHistoryJob(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/history/${jobId}`), { method: 'DELETE' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export async function fetchJobRecovery(jobId) {
+  const res = await apiFetch(getApiUrl(`/api/history/${jobId}/recovery`));
+  if (!res.ok) throw new Error(formatApiDetail(await res.json().catch(() => ({}))) || 'Recovery info unavailable');
+  return res.json();
+}
+
+export async function retryHistoryJob(jobId, apiKey) {
+  const res = await apiFetch(getApiUrl(`/api/history/${jobId}/retry`), {
+    method: 'POST',
+    headers: { 'X-Gemini-Key': apiKey },
+  });
+  if (!res.ok) throw new Error(formatApiDetail(await res.json().catch(() => ({}))) || 'Retry failed');
+  return res.json();
 }
 
 // --- config / settings ----------------------------------------------------
@@ -299,6 +352,52 @@ export async function saveZernio(payload) {
 export async function discoverZernioAccounts() {
   const res = await apiFetch(getApiUrl('/api/zernio/accounts'));
   if (!res.ok) throw new Error('Discover failed');
+  return res.json();
+}
+
+export async function fetchAutoPostCandidates() {
+  const res = await apiFetch(getApiUrl('/api/auto-post/candidates'));
+  if (!res.ok) throw new Error(formatApiDetail(await res.json().catch(() => ({}))) || 'Failed to load clips');
+  return res.json();
+}
+
+export async function fetchAutoPostCampaigns() {
+  const res = await apiFetch(getApiUrl('/api/auto-post/campaigns'));
+  if (!res.ok) throw new Error('Failed to load campaigns');
+  return res.json();
+}
+
+export async function fetchAutoPostCampaign(id) {
+  const res = await apiFetch(getApiUrl(`/api/auto-post/campaigns/${id}`));
+  if (!res.ok) throw new Error('Campaign not found');
+  return res.json();
+}
+
+export async function createAutoPostCampaign(body) {
+  const res = await apiFetch(getApiUrl('/api/auto-post/campaigns'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(formatApiDetail(await res.json().catch(() => ({}))) || 'Create campaign failed');
+  return res.json();
+}
+
+export async function pauseAutoPostCampaign(id) {
+  const res = await apiFetch(getApiUrl(`/api/auto-post/campaigns/${id}/pause`), { method: 'POST' });
+  if (!res.ok) throw new Error('Pause failed');
+  return res.json();
+}
+
+export async function resumeAutoPostCampaign(id) {
+  const res = await apiFetch(getApiUrl(`/api/auto-post/campaigns/${id}/resume`), { method: 'POST' });
+  if (!res.ok) throw new Error('Resume failed');
+  return res.json();
+}
+
+export async function retryAutoPostItem(campaignId, itemId) {
+  const res = await apiFetch(getApiUrl(`/api/auto-post/campaigns/${campaignId}/items/${itemId}/retry`), { method: 'POST' });
+  if (!res.ok) throw new Error('Retry failed');
   return res.json();
 }
 
