@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { getApiUrl } from '../config';
+import { getApiUrl } from '../config.js';
 import { apiFetch } from '../lib/apiToken';
 
 /**

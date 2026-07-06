@@ -21,6 +21,7 @@ graphify-out/
 
 # Temporary files / runtime dirs
 temp_*
+clipit-95-temp/
 tmp/
 /tmp/
 uploads/

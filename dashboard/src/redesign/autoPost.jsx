@@ -68,11 +68,11 @@ function CampaignRow({ c, onOpen, onPause, onResume }) {
         <span>{counts.pending || 0} queued</span>
         <span>{counts.failed || 0} failed</span>
       </div>
-      <div className="ap-c-actions" onClick={(e) => e.stopPropagation()}>
+      <div className="ap-c-actions">
         {c.status === 'active' ? (
-          <Btn variant="ghost" size="sm" onClick={() => onPause(c.id)}>Pause</Btn>
+          <Btn variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onPause(c.id); }}>Pause</Btn>
         ) : c.status === 'paused' ? (
-          <Btn variant="secondary" size="sm" onClick={() => onResume(c.id)}>Resume</Btn>
+          <Btn variant="secondary" size="sm" onClick={(e) => { e.stopPropagation(); onResume(c.id); }}>Resume</Btn>
         ) : (
           <span className="cm-small">{c.status}</span>
         )}

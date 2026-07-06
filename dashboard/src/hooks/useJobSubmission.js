@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { submitProcessJob, submitBatchJob } from '../lib/api';
-import { getApiUrl } from '../config';
+import { getApiUrl } from '../config.js';
 import { apiFetch } from '../lib/apiToken';
 import { tasteInstructionSuffix } from '../lib/taste';
 import { batchJobRow } from '../lib/downloadProgress';

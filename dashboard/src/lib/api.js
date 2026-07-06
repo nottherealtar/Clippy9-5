@@ -1,5 +1,5 @@
-import { getApiUrl } from '../config';
-import { apiFetch } from './apiToken';
+import { getApiUrl } from '../config.js';
+import { apiFetch } from './apiToken.js';
 
 async function throwFromResponse(res) {
   const text = await res.text();
